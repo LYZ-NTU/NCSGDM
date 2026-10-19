@@ -1,0 +1,140 @@
+import math
+from collections import deque
+import torch
+
+
+WEIGHT_DECAY = 1e-4
+FRACTIONAL_DT = 0.03
+
+
+def caputo_l1_increment(history, alpha):
+
+    if len(history) < 2:
+        return torch.zeros_like(history[0])
+
+    result = torch.zeros_like(history[0])
+
+    for k in range(len(history) - 1):
+        weight = (k + 1) ** (1 - alpha) - k ** (1 - alpha)
+        result.add_(
+            history[k] - history[k + 1],
+            alpha=float(weight),
+        )
+
+    result.div_(math.gamma(2 - alpha))
+    result.mul_(float(FRACTIONAL_DT) ** (-float(alpha)))
+
+    return result
+
+
+class NCSGDM(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr=1e-2,
+        momentum=0.93,
+        alpha=0.60,
+        frac_scale=0.30,
+        cd_beta=0.15,
+        memory=4,
+        norm_cap=0.80,
+        weight_decay=WEIGHT_DECAY,
+    ):
+        super().__init__(
+            params,
+            dict(
+                lr=lr,
+                momentum=momentum,
+                alpha=alpha,
+                frac_scale=frac_scale,
+                cd_beta=cd_beta,
+                memory=memory,
+                norm_cap=norm_cap,
+                weight_decay=weight_decay,
+            ),
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = closure() if closure is not None else None
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.detach().clone()
+                if group["weight_decay"]:
+                    grad.add_(p, alpha=group["weight_decay"])
+
+                hist = self.state[p].setdefault(
+                    "grad_history",
+                    deque(maxlen=group["memory"] + 1),
+                )
+
+
+                old = list(hist)
+                central = (
+                    0.5 * (grad - old[1])
+                    if len(old) >= 2
+                    else torch.zeros_like(grad)
+                )
+
+
+                hist.appendleft(grad.clone())
+                frac = caputo_l1_increment(
+                    list(hist),
+                    group["alpha"],
+                )
+
+
+                effective = (
+                    grad
+                    + group["cd_beta"] * central
+                    + group["frac_scale"] * frac
+                )
+
+                buf = self.state[p].setdefault(
+                    "momentum_buffer",
+                    torch.zeros_like(p),
+                )
+                buf.mul_(group["momentum"]).add_(effective)
+
+                rms = (
+                    effective.square()
+                    .mean()
+                    .sqrt()
+                    .clamp_min(1e-8)
+                )
+                scale = torch.clamp(
+                    1.0 / rms,
+                    max=group["norm_cap"],
+                )
+
+                p.add_(buf * scale, alpha=-group["lr"])
+
+        return loss
+
+
+FORMAL_NCSGDM_CONFIG = {
+    "lr": 0.01,
+    "momentum": 0.98,
+    "alpha": 0.60,
+    "frac_scale": 0.20,
+    "cd_beta": 0.12,
+    "memory": 4,
+    "norm_cap": 0.40,
+}
+
+# use：
+# optimizer = NCSGDM(
+#     model.parameters(),
+#     weight_decay=WEIGHT_DECAY,
+#     **FORMAL_NCSGDM_CONFIG,
+# )
+#
+# optimizer.zero_grad(set_to_none=True)
+# loss = criterion(model(xb), yb)
+# loss.backward()
+# torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.75)
+# optimizer.step()
